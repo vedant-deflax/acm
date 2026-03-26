@@ -1,32 +1,44 @@
 # backend/main.py
 """
-Autonomous Constellation Manager (ACM) — FastAPI Application
-Exposes all required REST endpoints on port 8000.
+ACM (Autonomous Constellation Manager) — FastAPI application entry point.
+Exposes all required APIs on port 8000.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from datetime import datetime
-from typing import Optional
 import logging
-import os
+import time
+from contextlib import asynccontextmanager
 
-from backend.core.simulation import get_simulation
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+from backend.api.routes import router
+
+# ── Logging ───────────────────────────────────────────────────────────────── #
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("acm.api")
+logger = logging.getLogger("acm")
+
+
+# ── App ───────────────────────────────────────────────────────────────────── #
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("ACM starting up — Autonomous Constellation Manager ready.")
+    yield
+    logger.info("ACM shutting down.")
+
 
 app = FastAPI(
     title="Autonomous Constellation Manager",
-    description="National Space Hackathon 2026 — ACM Backend API",
+    description="Orbital debris avoidance & constellation management system",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
+# Allow frontend (Vite dev server) to call the API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,173 +47,43 @@ app.add_middleware(
 )
 
 
-# ------------------------------------------------------------------ #
-#  Pydantic Request/Response Models
-# ------------------------------------------------------------------ #
-
-class Vector3(BaseModel):
-    x: float
-    y: float
-    z: float
-
-class SpaceObject(BaseModel):
-    id: str
-    type: str   # "SATELLITE" | "DEBRIS"
-    r: Vector3
-    v: Vector3
-
-class TelemetryRequest(BaseModel):
-    timestamp: str
-    objects: list[SpaceObject]
-
-class BurnRequest(BaseModel):
-    burn_id: str
-    burnTime: str
-    deltaV_vector: Vector3
-
-class ManeuverRequest(BaseModel):
-    satelliteId: str
-    maneuver_sequence: list[BurnRequest]
-
-class SimStepRequest(BaseModel):
-    step_seconds: float
+# ── Request timing middleware ─────────────────────────────────────────────── #
+@app.middleware("http")
+async def add_timing(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+    if elapsed_ms > 500:
+        logger.warning(f"Slow request: {request.method} {request.url.path} took {elapsed_ms:.0f}ms")
+    return response
 
 
-# ------------------------------------------------------------------ #
-#  Endpoints
-# ------------------------------------------------------------------ #
+# ── Global error handler ──────────────────────────────────────────────────── #
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc)},
+    )
 
-@app.get("/health")
-async def health():
-    sim = get_simulation()
+
+# ── Register routes ───────────────────────────────────────────────────────── #
+app.include_router(router)
+
+
+@app.get("/")
+async def root():
     return {
-        "status": "OK",
-        "simulation_time": sim.current_time.isoformat(),
-        "satellites": len(sim.satellites),
-        "debris_objects": len(sim.debris_states),
+        "service": "Autonomous Constellation Manager",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "status": "/api/status",
     }
 
 
-@app.post("/api/telemetry")
-async def ingest_telemetry(req: TelemetryRequest):
-    """Ingest high-frequency telemetry state vectors."""
-    sim = get_simulation()
-
-    try:
-        ts = datetime.fromisoformat(req.timestamp.replace("Z", "+00:00"))
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid timestamp format")
-
-    objects_raw = [
-        {
-            "id":   obj.id,
-            "type": obj.type,
-            "r":    {"x": obj.r.x, "y": obj.r.y, "z": obj.r.z},
-            "v":    {"x": obj.v.x, "y": obj.v.y, "z": obj.v.z},
-        }
-        for obj in req.objects
-    ]
-
-    count = sim.ingest_telemetry(ts, objects_raw)
-    active_warnings = sim.conjunction_assessor.quick_count()
-
-    logger.info(f"Telemetry: {count} objects ingested, {active_warnings} active CDMs")
-
-    return {
-        "status": "ACK",
-        "processed_count": count,
-        "active_cdm_warnings": active_warnings,
-    }
-
-
-@app.post("/api/maneuver/schedule", status_code=202)
-async def schedule_maneuver(req: ManeuverRequest):
-    """Schedule an evasion/recovery maneuver sequence for a satellite."""
-    sim = get_simulation()
-
-    sequence_raw = [
-        {
-            "burn_id":       b.burn_id,
-            "burnTime":      b.burnTime,
-            "deltaV_vector": {"x": b.deltaV_vector.x, "y": b.deltaV_vector.y, "z": b.deltaV_vector.z},
-        }
-        for b in req.maneuver_sequence
-    ]
-
-    result = sim.schedule_maneuver(req.satelliteId, sequence_raw)
-
-    if result["status"] in ("ERROR", "REJECTED"):
-        raise HTTPException(status_code=400, detail=result.get("reason", "Unknown error"))
-
-    return result
-
-
-@app.post("/api/simulate/step")
-async def simulate_step(req: SimStepRequest):
-    """Advance simulation clock by step_seconds, propagating all objects."""
-    if req.step_seconds <= 0 or req.step_seconds > 86400:
-        raise HTTPException(status_code=400, detail="step_seconds must be between 0 and 86400")
-
-    sim = get_simulation()
-    result = sim.step(req.step_seconds)
-    logger.info(f"Tick: +{req.step_seconds}s | {result['collisions_detected']} collisions | "
-                f"{result['maneuvers_executed']} maneuvers")
-    return result
-
-
-@app.get("/api/visualization/snapshot")
-async def get_snapshot():
-    """Return optimized snapshot for the Orbital Insight visualizer."""
-    sim = get_simulation()
-    return sim.get_snapshot()
-
-
-@app.get("/api/status/fleet")
-async def fleet_status():
-    """Return full fleet health summary."""
-    sim = get_simulation()
-    fleet = []
-    for sat in sim.satellites.values():
-        fleet.append({
-            "id":             sat.sat_id,
-            "status":         sat.status,
-            "fuel_kg":        round(sat.mass_fuel_kg, 3),
-            "fuel_fraction":  round(sat.fuel_fraction, 4),
-            "is_eol":         sat.is_eol,
-            "in_slot":        sat.is_in_station_box(),
-            "total_dv_m_s":   round(sat.total_dv_used_km_s * 1000, 4),
-            "outage_seconds": round(sat.outage_seconds, 1),
-            "queued_burns":   len([b for b in sat.maneuver_queue if not b.executed]),
-        })
-    return {
-        "timestamp": sim.current_time.isoformat(),
-        "fleet":     fleet,
-        "total_collisions": sim.collision_count,
-    }
-
-
-@app.get("/api/conjunctions")
-async def get_conjunctions():
-    """Return current active conjunction warnings."""
-    sim = get_simulation()
-    events = sim.conjunction_assessor.assess_all(horizon_s=86400, dt=30.0)
-    return {
-        "timestamp": sim.current_time.isoformat(),
-        "total": len(events),
-        "events": [
-            {
-                "satellite_id":          e.satellite_id,
-                "debris_id":             e.debris_id,
-                "tca_seconds_from_now":  round(e.tca_seconds_from_now, 1),
-                "miss_distance_km":      round(e.miss_distance_km, 4),
-                "risk_level":            e.risk_level,
-            }
-            for e in events[:50]  # Return top 50 most critical
-        ]
-    }
-
-
-# Serve frontend build if available
-frontend_build = "frontend/dist"
-if os.path.exists(frontend_build):
-    app.mount("/", StaticFiles(directory=frontend_build, html=True), name="frontend")
+# ── Dev runner ────────────────────────────────────────────────────────────── #
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

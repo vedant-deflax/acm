@@ -26,7 +26,7 @@ STATION_KEEP_BOX_KM      = 10.0    # Station-keeping radius (km)
 # --- Propagation ---
 PROPAGATION_HORIZON_S = 86400.0    # 24-hour prediction window (seconds)
 DEFAULT_DT_S          = 10.0       # Default RK4 timestep (seconds)
-SIGNAL_LATENCY_S      = 10.0       # Ground uplink latency (seconds)
+SIGNAL_LATENCY_S      = 600.0       # Ground uplink latency (seconds)
 
 # --- Spatial Indexing ---
 KDTREE_COARSE_RADIUS_KM = 50.0     # Pre-filter radius before precise TCA check

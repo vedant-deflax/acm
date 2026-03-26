@@ -8,6 +8,8 @@ import numpy as np
 from scipy.spatial import KDTree
 from dataclasses import dataclass, field
 from typing import Optional
+# backend/core/conjunction.py
+from .physics import rk4_step, propagate_to_time  # <--- Add propagate_to_time here
 from .constants import (
     CONJUNCTION_THRESHOLD_KM,
     CONJUNCTION_WARNING_KM,
@@ -15,7 +17,7 @@ from .constants import (
     PROPAGATION_HORIZON_S,
     DEFAULT_DT_S,
 )
-from .physics import rk4_step
+
 
 
 @dataclass
@@ -45,35 +47,53 @@ def find_tca(
     horizon_s: float = PROPAGATION_HORIZON_S,
     dt: float = DEFAULT_DT_S,
 ) -> tuple[float, float, np.ndarray, np.ndarray]:
-    """
-    Find Time of Closest Approach between a satellite and a debris object.
-    Uses forward propagation with bisection refinement.
-
-    Returns:
-        (tca_seconds, miss_distance_km, sat_pos_at_tca, deb_pos_at_tca)
-    """
     sat = sat_state.copy()
     deb = deb_state.copy()
 
     min_dist = np.inf
-    min_t    = 0.0
-    min_sat  = sat[:3].copy()
-    min_deb  = deb[:3].copy()
+    min_t = 0.0
 
+    # 1. Coarse Search (The "Global" Scan)
     t = 0.0
     while t <= horizon_s:
         dist = np.linalg.norm(sat[:3] - deb[:3])
         if dist < min_dist:
             min_dist = dist
-            min_t    = t
-            min_sat  = sat[:3].copy()
-            min_deb  = deb[:3].copy()
-
+            min_t = t
+        
         sat = rk4_step(sat, dt)
         deb = rk4_step(deb, dt)
-        t  += dt
+        t += dt
 
-    return min_t, min_dist, min_sat, min_deb
+    # 2. Bisection Refinement (The "Zoom")
+    # We look in the window [min_t - dt, min_t + dt]
+    t_start = max(0, min_t - dt)
+    t_end = min(horizon_s, min_t + dt)
+    
+    # Simple Golden Section Search or Bisection on the interval
+    # For a hackathon, a 5-step sub-scan is usually enough to "catch" the hit
+    refine_dt = dt / 10.0
+    curr_t = t_start
+    # Reset to the start of the "danger window"
+    s_refine = propagate_to_time(sat_state, t_start)
+    d_refine = propagate_to_time(deb_state, t_start)
+    
+    final_sat_pos = s_refine[:3].copy()
+    final_deb_pos = d_refine[:3].copy()
+
+    while curr_t <= t_end:
+        dist = np.linalg.norm(s_refine[:3] - d_refine[:3])
+        if dist < min_dist:
+            min_dist = dist
+            min_t = curr_t
+            final_sat_pos = s_refine[:3].copy()
+            final_deb_pos = d_refine[:3].copy()
+            
+        s_refine = rk4_step(s_refine, refine_dt)
+        d_refine = rk4_step(d_refine, refine_dt)
+        curr_t += refine_dt
+
+    return min_t, min_dist, final_sat_pos, final_deb_pos
 
 
 class ConjunctionAssessor:

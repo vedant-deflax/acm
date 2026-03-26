@@ -110,3 +110,15 @@ if __name__ == "__main__":
     debris = sum(1 for o in payload["objects"] if o["type"] == "DEBRIS")
     print(f"  Satellites: {sats}")
     print(f"  Debris:     {debris}")
+
+# Add this to the bottom of your script
+    import requests
+    print("Uploading to backend...")
+    try:
+        response = requests.post("http://localhost:8000/api/telemetry", json=payload)
+        if response.status_code == 200:
+            print(f"Successfully ingested! Status: {response.json()['status']}")
+        else:
+            print(f"Failed to ingest: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Could not connect to backend: {e}")

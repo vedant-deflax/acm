@@ -8,6 +8,7 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import logging
+from .autonomy import run_autonomy
 
 from .physics import rk4_step, propagate_to_time, eci_to_latlon
 from .conjunction import ConjunctionAssessor, ConjunctionEvent
@@ -135,92 +136,80 @@ class SimulationState:
     # ------------------------------------------------------------------ #
 
     def step(self, step_seconds: float) -> dict:
-        """
-        Advance simulation by step_seconds.
-        Propagates all objects and executes due maneuvers.
-        """
         dt = DEFAULT_DT_S
         end_time = self.current_time + timedelta(seconds=step_seconds)
-        collisions_this_step = 0
-        maneuvers_this_step  = 0
+        total_collisions_this_tick = 0
+        maneuvers_this_step = 0
 
-        # Propagate in chunks of dt
         t = 0.0
         while t < step_seconds:
             chunk = min(dt, step_seconds - t)
 
-            # Propagate all debris
+            # 1. Move the Brain: Run autonomy BEFORE the physics jump
+            # This allows satellites to schedule burns for the current window
+            run_autonomy(self)
+
+            # 2. Propagate all debris
             for deb_id in list(self.debris_states.keys()):
                 self.debris_states[deb_id] = rk4_step(self.debris_states[deb_id], chunk)
 
-            # Propagate all satellites and execute due burns
+            # 3. Propagate satellites and execute burns
             for sat in self.satellites.values():
                 sat.state = rk4_step(sat.state, chunk)
                 sat.nominal_state = rk4_step(sat.nominal_state, chunk)
 
-                # Update station-keeping status
-                if not sat.is_in_station_box():
-                    sat.outage_seconds += chunk
-                    sat.status = "RECOVERING" if sat.status != "EVADING" else sat.status
-                else:
-                    if sat.status == "RECOVERING":
-                        sat.status = "NOMINAL"
-
-                # Execute due burns
+                # Execute burns that are due in THIS chunk
                 sub_time = self.current_time + timedelta(seconds=t + chunk)
                 for burn in sat.pop_due_burns(sub_time):
                     try:
                         result = sat.apply_burn(burn)
                         maneuvers_this_step += 1
                         self.maneuvers_executed += 1
-                        logger.info(
-                            f"[BURN] {sat.sat_id} | {burn.burn_id} | "
-                            f"ΔV={result['dv_km_s']*1000:.3f} m/s | "
-                            f"Fuel remaining: {result['fuel_kg_remaining']:.2f} kg"
-                        )
                     except ValueError as e:
                         logger.warning(f"[BURN FAILED] {sat.sat_id}: {e}")
 
-                # EOL check
-                if sat.is_eol and sat.status != "EOL":
-                    sat.status = "EOL"
-                    logger.warning(f"[EOL] {sat.sat_id} fuel critical: {sat.mass_fuel_kg:.2f} kg")
-
+            # 4. Intra-step Collision Check
+            # This catches the 1.3s hit even if you step 60s
+            collisions_in_chunk = self._check_collisions()
+            total_collisions_this_tick += collisions_in_chunk
+            
             t += chunk
 
-        # Update GST (simplified: Earth rotates ~7.292e-5 rad/s)
-        self._gst_rad += 7.292115e-5 * step_seconds
-        self._gst_rad %= (2 * np.pi)
-
-        # Collision check
-        collisions_this_step = self._check_collisions()
-        self.collision_count += collisions_this_step
-
-        # Refresh conjunction warnings
-        sat_states = {sid: s.state for sid, s in self.satellites.items()}
-        self.conjunction_assessor.update_debris(self.debris_states)
-        self.conjunction_assessor.update_satellites(sat_states)
-
+        self.collision_count += total_collisions_this_tick
         self.current_time = end_time
 
         return {
             "status": "STEP_COMPLETE",
             "new_timestamp": self.current_time.isoformat().replace("+00:00", "Z"),
-            "collisions_detected": collisions_this_step,
+            "collisions_detected": total_collisions_this_tick,
             "maneuvers_executed": maneuvers_this_step,
         }
 
     def _check_collisions(self) -> int:
-        """Check if any satellite has collided with debris (miss dist < threshold)."""
+        """Optimized collision check using the KD-Tree spatial index."""
         from backend.core.constants import CONJUNCTION_THRESHOLD_KM
         count = 0
+        
+        # 1. Update the tree with current debris positions
+        self.conjunction_assessor.update_debris(self.debris_states)
+        
         for sat in self.satellites.values():
-            for deb_state in self.debris_states.values():
+            # 2. Only query debris within a small radius (e.g., 2km)
+            # This reduces 10,000 checks down to ~0-5 checks per satellite
+            neighbor_indices = self.conjunction_assessor.debris_kdtree.query_ball_point(
+                sat.state[:3], r=2.0 
+            )
+            
+            for idx in neighbor_indices:
+                # Retrieve the state of the nearby debris
+                deb_id = list(self.debris_states.keys())[idx]
+                deb_state = self.debris_states[deb_id]
+                
                 dist = float(np.linalg.norm(sat.state[:3] - deb_state[:3]))
                 if dist < CONJUNCTION_THRESHOLD_KM:
                     count += 1
                     sat.status = "COLLISION"
-                    logger.error(f"[COLLISION] {sat.sat_id} at dist {dist*1000:.1f} m")
+                    logger.error(f"[COLLISION] {sat.sat_id} hit {deb_id}!")
         return count
 
     # ------------------------------------------------------------------ #

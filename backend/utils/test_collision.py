@@ -18,7 +18,7 @@ def generate_test_collision():
             "id": "DEB-INTERSECT-01",
             "type": "DEBRIS",
             # Start 20km away on the Y axis, moving toward Y=0
-            "r": {"x": 6928.05, "y": 20.0, "z": 0.0}, # Offset by only 50m on X
+            "r": {"x": 6928.05, "y": 50.0, "z": 0.0}, # Offset by only 50m on X
             "v": {"x": 0.0, "y": -7.6, "z": 0.0}     # Head-on collision
         }
     ]

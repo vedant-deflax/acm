@@ -19,7 +19,6 @@ from .constants import (
 )
 
 
-
 @dataclass
 class ConjunctionEvent:
     satellite_id: str

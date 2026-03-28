@@ -50,11 +50,15 @@ def run_autonomy(sim) -> dict:
     events = sim.conjunction_assessor.assess_all()
     sim.active_cdm_warnings = events
 
+    active_critical_satellites = set()
+
     for event in events:
         if event.risk_level != "CRITICAL":
             continue
 
         pair_key = f"{event.satellite_id}::{event.debris_id}"
+        active_critical_satellites.add(event.satellite_id)
+
         if pair_key in _active_evasions:
             actions["skipped"] += 1
             continue
@@ -88,6 +92,17 @@ def run_autonomy(sim) -> dict:
                 )
         else:
             actions["skipped"] += 1
+
+    # Mark strategy statuses clearly so dashboard reflects active state
+    for sat_id, sat in sim.satellites.items():
+        if sat.status in ("EOL", "COLLISION"):
+            continue
+        if sat_id in active_critical_satellites:
+            sat.status = "EVADING"
+        elif any(burn for burn in sat.maneuver_queue if not burn.executed):
+            sat.status = "EVADING"
+        else:
+            sat.status = "NOMINAL"
 
     # Prune stale evasion keys (conjunctions that are no longer active)
     still_active = set()

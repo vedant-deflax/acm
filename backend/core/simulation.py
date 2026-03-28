@@ -196,7 +196,7 @@ class SimulationState:
         for sat in self.satellites.values():
             # 2. Only query debris within a small radius (e.g., 2km)
             # This reduces 10,000 checks down to ~0-5 checks per satellite
-            neighbor_indices = self.conjunction_assessor.debris_kdtree.query_ball_point(
+            neighbor_indices = self.conjunction_assessor._kdtree.query_ball_point(
                 sat.state[:3], r=2.0 
             )
             
